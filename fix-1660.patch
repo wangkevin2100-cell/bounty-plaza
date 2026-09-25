@@ -1,0 +1,68 @@
+-- FIX: forward-only migration adding a nullable fee_lamports column beside fee_micro
+-- db/migrations/0007_add_fee_lamports_to_inference_calls.sql
+--
+-- Records the exact Solana network fee (in lamports) reported by the signer for
+-- the confirmed x402 settlement transaction. This is additive and factual: it
+-- does NOT change budget accounting. `fee_micro` (ceiling price) is left exactly
+-- as it is, so spending can never be under-counted.
+--
+-- Forward-only: there is intentionally no down migration.
+-- Existing rows keep fee_lamports = NULL and remain valid.
+
+ALTER TABLE inference_calls
+    ADD COLUMN IF NOT EXISTS fee_lamports BIGINT NULL;
+
+COMMENT ON COLUMN inference_calls.fee_lamports IS
+    'Exact network fee in lamports of the confirmed settlement transaction; NULL for rows written before this column existed.';
+
+
+// FIX: carry fee_lamports from the signer's PayResult through to the ledger
+// packages/x402/src/client.ts
+
+import type { PayResult, Signer } from "@bounty/signer";
+import type { LedgerStore } from "./store";
+
+export interface InferenceRequest {
+  /** x402 resource being paid for. */
+  url: string;
+  /** Everything the signer needs to build and submit the transfer. */
+  body: unknown;
+  /** Row identity / attribution for the ledger. */
+  metadata: Record<string, unknown>;
+}
+
+/**
+ * Settle a paid inference call over x402 and record it in the ledger.
+ *
+ * Two numbers are persisted, on purpose:
+ *   - `fee_micro`    — conservative micro-USD derived from `solUsdCeilingPrice`
+ *                      ($400). Drives the spend cap. UNCHANGED by this fix.
+ *   - `fee_lamports` — the exact network fee the confirmed transaction cost,
+ *                      straight from `PayResult.fee_lamports`. New factual
+ *                      column for accounting/audit.
+ */
+export async function settleInferenceCall(
+  signer: Signer,
+  store: LedgerStore,
+  req: InferenceRequest,
+): Promise<PayResult> {
+  const res: PayResult = await signer.pay({
+    url: req.url,
+    body: req.body,
+  });
+
+  await store.recordInferenceCall({
+    ...req.metadata,
+    tx_signature: res.tx_signature,
+
+    // Conservative, ceiling-priced micro-USD. Keep exactly as-is so the
+    // budget stays conservative and capped the way it always has been.
+    fee_micro: res.fee_micro,
+
+    // NEW: stop throwing the exact figure away. Nullable on the DB side, so
+    // pass it straight through when present.
+    fee_lamports: res.fee_lamports ?? null,
+  });
+
+  return res;
+}
