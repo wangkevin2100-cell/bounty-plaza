@@ -1,0 +1,167 @@
+# FIX: Add bounty validation to reject non-technical / donation-solicitation bounties before redemption
+# scripts/redeem_issue.py
+
+"""
+Issue redemption module for bounty-plaza.
+
+Handles claims/redemptions for bounty issues. Includes validation so that
+low-quality or off-topic "bounties" (e.g. donation / sponsorship solicitations
+that do not describe an actual code fix) are rejected instead of being paid out.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from typing import Optional
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# Bounties must be actionable code tasks. These keywords describe a real
+# engineering deliverable and must appear in the issue title/body.
+_TECHNICAL_KEYWORDS = (
+    "bug", "fix", "error", "crash", "panic", "regression", "vulnerability",
+    "security", "cve", "race", "deadlock", "memory leak", "overflow",
+    "performance", "perf", "optimiz", "refactor", "implement", "feature",
+    "test", "coverage", "docs", "api", "cli", "p2p", "ghostdag", "crypto",
+    "consensus", "protocol", "serialization", "deserialization", "build",
+)
+
+# Patterns that indicate a donation / sponsorship solicitation rather than a
+# genuine engineering bounty.
+_DONATION_PATTERNS = (
+    r"\bdonat(?:e|ion|ions|ing)\b",
+    r"\bsponsor(?:ship|s|ing|ed)?\b",
+    r"\bfund(?:ing|s|ed|ing)?\b",
+    r"\bwallet address\b",
+    r"\busdt\b",
+    r"\busdc\b",
+    r"\btrc ?20\b",
+    r"\berc ?20\b",
+    r"\bstable ?coins?\b",
+    r"\bpaypal\b",
+    r"\bstripe\b",
+    r"\bprivately\b",
+    r"\bdm\b",
+    r"\bsupport (?:my|the|this)\b.*\bdev",
+)
+
+_DONATION_RE = re.compile("|".join(_DONATION_PATTERNS), re.IGNORECASE)
+_TECH_RE = re.compile("|".join(map(re.escape, _TECHNICAL_KEYWORDS)), re.IGNORECASE)
+
+# Minimum amount of descriptive content required for a bounty to be payable.
+_MIN_BODY_CHARS = 200
+
+
+@dataclass
+class ValidationResult:
+    ok: bool
+    reason: Optional[str] = None
+
+
+def validate_bounty(issue: dict) -> ValidationResult:
+    """
+    Validate that ``issue`` is a legitimate, actionable engineering bounty.
+
+    Returns a ``ValidationResult``. If ``ok`` is False, ``reason`` explains
+    why the issue should NOT be redeemed/paid out.
+    """
+    title = (issue.get("title") or "").strip()
+    body = (issue.get("body") or "").strip()
+    text = f"{title}\n{body}"
+
+    if not title and not body:
+        return ValidationResult(False, "empty issue title and body")
+
+    # 1. Reject explicit donation / sponsorship solicitations.
+    donation_matches = _DONATION_RE.findall(text)
+    has_technical = bool(_TECH_RE.search(text))
+
+    if donation_matches and not has_technical:
+        return ValidationResult(
+            False,
+            "donation/sponsorship solicitation without a technical deliverable "
+            f"(matched: {', '.join(sorted({m.lower() for m in donation_matches}))})",
+        )
+
+    # 2. Require an actionable engineering signal.
+    if not has_technical:
+        return ValidationResult(
+            False,
+            "no technical/engineering deliverable found (not a code bounty)",
+        )
+
+    # 3. Require enough detail to actually work on the issue.
+    if len(body) < _MIN_BODY_CHARS:
+        return ValidationResult(
+            False,
+            f"issue body too short ({len(body)} chars < {_MIN_BODY_CHARS}); "
+            "insufficient detail for an actionable bounty",
+        )
+
+    return ValidationResult(True)
+
+
+def _find_claim_comment(issue: dict) -> Optional[dict]:
+    for comment in issue.get("comments", []) or []:
+        body = (comment.get("body") or "").strip()
+        if body == "/claim" or body.startswith("/claim"):
+            return comment
+    return None
+
+
+def redeem_issue(issue: dict, *, dry_run: bool = False) -> dict:
+    """
+    Attempt to redeem a single bounty issue.
+
+    Returns a dict describing the outcome:
+        {"status": "redeemed"|"rejected", "reason": ..., "issue": <url/number>}
+    """
+    identifier = issue.get("url") or issue.get("number") or issue.get("title")
+
+    claim = _find_claim_comment(issue)
+    if claim is None:
+        return {
+            "status": "rejected",
+            "reason": "no /claim comment found; issue was never locked",
+            "issue": identifier,
+        }
+
+    result = validate_bounty(issue)
+    if not result.ok:
+        return {
+            "status": "rejected",
+            "reason": f"failed bounty validation: {result.reason}",
+            "issue": identifier,
+        }
+
+    if dry_run:
+        return {
+            "status": "redeemed",
+            "reason": "dry-run: validated successfully",
+            "issue": identifier,
+        }
+
+    # --- actual redemption side effects go here ----------------------------
+    # e.g. mark claim accepted, notify winner, transfer coin reward, etc.
+    return {
+        "status": "redeemed",
+        "reason": "bounty validated and redeemed",
+        "issue": identifier,
+    }
+
+
+if __name__ == "__main__":
+    # Quick self-check against the reported off-topic bounty.
+    _sample = {
+        "title": "[Bounty] \U0001F4B0 Donate $10-$100 USDT/USDC \u2014 Support VeloDAG Core Rust Dev",
+        "body": (
+            "Looking for small bug bounties & sponsors. If you want to fund a bug fix "
+            "or donate $10-$100 in stablecoins (USDT / USDC) comment on this issue. "
+            "I will share wallet address privately. No Stripe/PayPal needed. TRC20 supported."
+        ),
+        "comments": [{"body": "/claim"}],
+    }
+    print(redeem_issue(_sample, dry_run=True))
