@@ -1,0 +1,62 @@
+// FIX: Generate the sampling random threshold at full FP32 resolution instead of
+// rounding it to bfloat16, so the FP32 CDF comparison is no longer biased.
+// File: ttnn/cpp/ttnn/operations/reduction/sampling/device/kernels/dataflow/reader_sampling.cpp
+
+#include "dataflow_api.h"
+#include "debug/dprint.h"
+
+// -----------------------------------------------------------------------------
+// Full-resolution uniform [0, 1) random number generator.
+//
+// The previous implementation produced a bfloat16 threshold. A bfloat16 only has
+// 8 mantissa bits, so the threshold only had ~256 distinct values in (0, 1) and
+// the small-probability tail of the CDF was effectively quantized away. We now
+// compute the threshold as a 32-bit integer mapped directly into a float, which
+// has 24 mantissa bits and therefore ~2^24 distinct values in (0, 1).
+// -----------------------------------------------------------------------------
+FORCE_INLINE uint32_t xorshift32(uint32_t& state) {
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+    return state;
+}
+
+// Returns a uniformly distributed FP32 value in [0, 1) with full mantissa
+// resolution. `state` must be seeded per (user, tile, iteration) so that
+// reproducibility and trace replay are preserved.
+FORCE_INLINE float uniform_fp32(uint32_t& state) {
+    const uint32_t r = xorshift32(state);
+    // Multiply by 2^-32 (exact power of two) so no extra rounding is introduced
+    // beyond the natural FP32 mantissa truncation of the integer.
+    return static_cast<float>(r) * (1.0f / 4294967296.0f);
+}
+
+void kernel_main() {
+    const uint32_t probs_addr       = get_arg_val<uint32_t>(0);
+    const uint32_t cdf_addr         = get_arg_val<uint32_t>(1);
+    const uint32_t threshold_addr   = get_arg_val<uint32_t>(2);
+    const uint32_t num_tiles        = get_arg_val<uint32_t>(3);
+    const uint32_t seed             = get_arg_val<uint32_t>(4);
+
+    constexpr uint32_t cb_probs     = tt::CB::c_in0;
+    constexpr uint32_t cb_threshold = tt::CB::c_in1;
+
+    // Per-program RNG state: seeded from the user-supplied seed so that the
+    // same seed yields the same draws across replay / trace capture.
+    uint32_t rng_state = seed != 0u ? seed : 0x9E3779B9u;
+
+    for (uint32_t tile = 0; tile < num_tiles; ++tile) {
+        cb_reserve_back(cb_threshold, 1);
+        uint32_t l1_write = get_write_ptr(cb_threshold);
+
+        // NOTE: the threshold is written as FP32 (not packed to bf16).
+        // The consumer compute kernel reads it as float and compares against
+        // the FP32 cumulative distribution.
+        volatile float* out = reinterpret_cast<volatile float*>(l1_write);
+        out[0] = uniform_fp32(rng_state);
+
+        // Prefetch a fresh random draw for every tile so that each sampled
+        // token in a multi-tile program uses an independent threshold.
+        cb_push_back(cb_threshold, 1);
+    }
+}
