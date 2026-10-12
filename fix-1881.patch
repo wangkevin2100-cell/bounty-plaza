@@ -1,0 +1,101 @@
+```python
+# FIX: Robustly parse bounty metadata (USD reward, coins, difficulty, card) from
+# issue titles/bodies that use the mixed Markdown + Chinese/English format used by
+# the RX 7900 XTX style bounties, and correctly derive the 24h claim lock.
+#
+# scripts/hunt_bounties.py
+
+import re
+from datetime import datetime, timedelta, timezone
+
+# ---------------------------------------------------------------------------
+# Regexes
+# ---------------------------------------------------------------------------
+# Matches "$50", "**Pays $50**", "USD $1,000", "赏金 $50", "50 USD", "US$50"
+_USD_RE = re.compile(
+    r"(?:US\$|\$)\s*([0-9][0-9,]*(?:\.[0-9]+)?)"
+    r"|([0-9][0-9,]*(?:\.[0-9]+)?)\s*(?:USD|usd|美元)",
+    re.IGNORECASE,
+)
+
+# Matches "62 coins", "62 积分币", "奖励 62 币"
+_COINS_RE = re.compile(
+    r"([0-9][0-9,]*)\s*(?:coins?|积分币|币|coins)\b",
+    re.IGNORECASE,
+)
+
+# Real vs. synthetic bounty markers
+_REAL_RE = re.compile(
+    r"(?:真实赏金|Real Reward|Real\s+Bounty|Pays\s+\$)", re.IGNORECASE
+)
+
+_DIFFICULTY_RE = re.compile(
+    r"(?:难度|Difficulty)[^\n]*?[/|:：]\s*(Easy|Medium|Hard|简单|中等|困难)",
+    re.IGNORECASE,
+)
+
+_CARD_RE = re.compile(r"`([a-z0-9]+-[a-z0-9]+-[0-9]+gb)`", re.IGNORECASE)
+
+# Command used to lock the task (bounties use `/claim`, issues used `/attempt`)
+_CLAIM_RE = re.compile(r"^\s*/(?:claim|attempt)\b", re.IGNORECASE | re.MULTILINE)
+
+_CLAIM_WINDOW = timedelta(hours=24)
+
+_DIFFICULTY_MAP = {
+    "easy": "Easy", "简单": "Easy",
+    "medium": "Medium", "中等": "Medium", "中": "Medium",
+    "hard": "Hard", "困难": "Hard",
+}
+
+
+def _to_amount(match):
+    """Return the first non-empty numeric group of a regex match as a float."""
+    for group in match.groups():
+        if group:
+            return float(group.replace(",", ""))
+    return None
+
+
+def parse_usd_reward(title: str, body: str) -> float:
+    """Extract the USD reward from a title/body. Returns 0.0 when none found."""
+    # Prefer the title (it holds the canonical "[Bounty] Bounty $50: ..." value).
+    for text in (title or "", body or ""):
+        m = _USD_RE.search(text)
+        if m:
+            amount = _to_amount(m)
+            if amount is not None:
+                return amount
+    return 0.0
+
+
+def parse_coin_reward(title: str, body: str) -> int:
+    """Extract the coin reward (e.g. '62 coins' / '62 coins')."""
+    for text in (body or "", title or ""):
+        m = _COINS_RE.search(text)
+        if m:
+            return int(float(m.group(1).replace(",", "")))
+    return 0
+
+
+def parse_difficulty(title: str, body: str) -> str:
+    """Normalize the difficulty label to Easy / Medium / Hard."""
+    for text in (body or "", title or ""):
+        m = _DIFFICULTY_RE.search(text)
+        if m:
+            key = m.group(1).strip().lower()
+            return _DIFFICULTY_MAP.get(key, m.group(1).strip().title())
+    return "Unknown"
+
+
+def parse_card(title: str, body: str) -> str | None:
+    """Extract the hardware card identifier (e.g. rx-7900-xtx-24gb)."""
+    for text in (title or "", body or ""):
+        m = _CARD_RE.search(text)
+        if m:
+            return m.group(1).lower()
+    # Fall back to a "| Card | `...` |" table row.
+    m = re.search(r"\|\s*Card\s*\|\s*`?([a-z0-9\-]+)`?\s*\|", body or "", re.I)
+    return m.group(1).lower() if m else None
+
+
+def is_real
