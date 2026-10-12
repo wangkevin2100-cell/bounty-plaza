@@ -1,0 +1,136 @@
+Looking at this issue, the repo automation (`bounty-plaza`) needs to correctly parse and redeem this type of bounty. The issue body uses a new format with `$50` real reward + `62 coins`, `/claim` (24h lock) and `/attempt` commands, plus a `REWARD_POLICY.md` reference. The current `redeem_issue.py` likely only understands the older single-reward format and a single claim command. Here is the fix:
+
+```python
+# FIX: redeem_issue.py now parses dual rewards ($USD + coins), accepts both
+# `/claim` (24h lock) and `/attempt`, and validates the bounty body layout.
+
+import os
+import re
+import json
+import datetime
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+log = logging.getLogger("redeem_issue")
+
+# --- regexes for the new (and legacy) bounty body formats -------------------
+USD_RE = re.compile(
+    r"(?:\$\s*(?P<d1>\d[\d,]*)(?:\.\d+)?)"          # $50 / $ 50
+    r"|(?:(?P<d2>\d[\d,]*)\s*(?:USD|usd|dollars?))"  # 50 USD
+)
+COIN_RE = re.compile(r"(?P<c>\d[\d,]*)\s*(?:coins?|积分币)", re.IGNORECASE)
+CLAIM_RE = re.compile(r"/(?:claim|attempt)\b", re.IGNORECASE)
+
+CLAIM_LOCK_HOURS = 24
+
+
+def _to_int(num: str) -> int:
+    """'1,234' -> 1234, tolerant of embedded commas / spaces."""
+    if num is None:
+        return 0
+    return int(re.sub(r"[,\s]", "", num))
+
+
+def parse_rewards(body: str) -> dict:
+    """Extract both the USD bounty and the coin reward from the issue body.
+
+    Returns {'usd': int, 'coins': int}. Either may be 0 when absent.
+    """
+    body = body or ""
+
+    usd = 0
+    m = USD_RE.search(body)
+    if m:
+        usd = _to_int(m.group("d1") or m.group("d2"))
+
+    coins = 0
+    m = COIN_RE.search(body)
+    if m:
+        coins = _to_int(m.group("c"))
+
+    # Fallback: the "真实赏金（USD）" block used by the newer template.
+    if usd == 0:
+        m = re.search(r"真实赏金[^\n]*?\n+\s*\$?\s*(\d[\d,]*)", body)
+        if m:
+            usd = _to_int(m.group(1))
+    if coins == 0:
+        m = re.search(r"积分币奖励[^\n]*?\n+\s*(\d[\d,]*)\s*coins?", body, re.IGNORECASE)
+        if m:
+            coins = _to_int(m.group(1))
+
+    return {"usd": usd, "coins": coins}
+
+
+def normalize_claim_command(comment_body: str):
+    """Return the normalized claim verb ('claim' | 'attempt') or None.
+
+    The new template documents `/claim` (24h lock) *and* the older `/attempt`
+    flow, so both must resolve to a claimable action.
+    """
+    if not comment_body:
+        return None
+    low = comment_body.lower()
+    if "/claim" in low:
+        return "claim"
+    if "/attempt" in low:
+        return "attempt"
+    return None
+
+
+def claim_expiry(now=None, hours=CLAIM_LOCK_HOURS):
+    """ISO-8601 timestamp at which a claim lock expires."""
+    now = now or datetime.datetime.utcnow()
+    return (now + datetime.timedelta(hours=hours)).replace(microsecond=0).isoformat() + "Z"
+
+
+def validate_bounty_body(body: str) -> (bool, list):
+    """Sanity-check that a bounty body has the fields we need to redeem it."""
+    errors = []
+    rewards = parse_rewards(body or "")
+    if rewards["usd"] <= 0 and rewards["coins"] <= 0:
+        errors.append("no reward found ($USD or coins)")
+    if not CLAIM_RE.search(body or ""):
+        errors.append("no claim command (/claim or /attempt) documented")
+    return (not errors, errors)
+
+
+def redeem_issue(issue, body=None):
+    """Main entry point used by the plaza worker.
+
+    `issue` is a dict with at least {'number', 'title', 'body'}.
+    Returns a dict describing the redemption decision.
+    """
+    body = body if body is not None else issue.get("body", "")
+    rewards = parse_rewards(body)
+
+    ok, errors = validate_bounty_body(body)
+    result = {
+        "number": issue.get("number"),
+        "title": issue.get("title"),
+        "rewards": rewards,
+        "valid": ok,
+        "errors": errors,
+        "claimable": ok,
+        "lock_hours": CLAIM_LOCK_HOURS,
+    }
+
+    if not ok:
+        log.warning("issue #%s not redeemable: %s", issue.get("number"), "; ".join(errors))
+        return result
+
+    result["claim_expires_at"] = claim_expiry()
+    log.info(
+        "issue #%s redeemable: $%s + %s coins (lock %sh)",
+        issue.get("number"), rewards["usd"], rewards["coins"], CLAIM_LOCK_HOURS,
+    )
+    return result
+
+
+if __name__ == "__main__":  # pragma: no cover - manual smoke test
+    import sys
+
+    path = sys.argv[1] if len(sys.argv) > 1 else None
+    sample = open(path, encoding="utf-8").read() if path else (
+        "### 真实赏金（USD）/ Real Reward\n$50\n"
+        "### 积分币奖励 / Coin Reward\n62 coins\n"
+        "
