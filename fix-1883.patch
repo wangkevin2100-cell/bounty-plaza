@@ -1,0 +1,68 @@
+{
+  "id": "rtx-2080-ti-11gb",
+  "vendor": "nvidia",
+  "name": "NVIDIA GeForce RTX 2080 Ti",
+  "vram_gb": 11,
+  "architecture": "Turing",
+  "compute_capability": "7.5",
+  "recommended_context": 65536,
+  "min_target_tok_per_s": 15,
+  "match": {
+    "pci.vendor": "10de",
+    "pci.device": ["1e04", "1e07"],
+    "name_regex": "(?i)RTX\\s*2080\\s*Ti"
+  }
+}
+
+
+# FIX: register the RTX 2080 Ti 11 GB card in the registry seed data so the
+# bounty in issue #1883 can be validated against it.
+
+# scripts/seed.py
+
+CARDS = [
+    # ... existing card entries ...
+    {
+        "id": "rtx-2080-ti-11gb",
+        "vendor": "nvidia",
+        "name": "NVIDIA GeForce RTX 2080 Ti",
+        "vram_gb": 11,
+        "architecture": "Turing",
+        "compute_capability": "7.5",
+        "recommended_context": 65536,   # 64K requirement
+        "min_target_tok_per_s": 15,
+        "match": {
+            "pci.vendor": "10de",
+            "pci.device": ["1e04", "1e07"],
+            "name_regex": r"(?i)RTX\s*2080\s*Ti",
+        },
+    },
+]
+
+
+def seed_cards(conn):
+    """Insert any missing cards into the registry idempotently."""
+    cur = conn.cursor()
+    for card in CARDS:
+        cur.execute(
+            """
+            INSERT INTO cards (id, vendor, name, vram_gb, architecture, match)
+            VALUES (%(id)s, %(vendor)s, %(name)s, %(vram_gb)s, %(architecture)s, %(match)s)
+            ON CONFLICT (id) DO UPDATE
+                SET vendor       = EXCLUDED.vendor,
+                    name         = EXCLUDED.name,
+                    vram_gb      = EXCLUDED.vram_gb,
+                    architecture = EXCLUDED.architecture,
+                    match        = EXCLUDED.match
+            """,
+            {
+                "id": card["id"],
+                "vendor": card["vendor"],
+                "name": card["name"],
+                "vram_gb": card["vram_gb"],
+                "architecture": card["architecture"],
+                # store the match block as JSON so the plugin can detect the card
+                "match": json.dumps(card["match"]),
+            },
+        )
+    conn.commit()
