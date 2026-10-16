@@ -1,0 +1,71 @@
+```typescript
+// FIX: Distinguish genuine Stellar account-not-found from RPC/transport failures in checkStellarRecipientReady
+
+// src/chains/stellar.ts
+//
+// Previously `checkStellarRecipientReady` used a bare `catch` around
+// `server.getAccount(recipient)` and returned `{ exists: false, ... }` for
+// EVERY failure. That made DNS errors, 503s and rate-limit responses from the
+// (explicitly rate-limited) public Horizon endpoint indistinguishable from an
+// account that was genuinely never funded, so `assertStellarRecipientReady`
+// sent callers down the wrong "fund this account" remediation path.
+//
+// Now only the SDK's account-not-found condition (NotFoundError / 404) maps to
+// `exists: false`. Everything else is surfaced as an infrastructure failure so
+// callers can retry.
+
+import { NotFoundError } from '@stellar/stellar-sdk';
+
+/** Small, explicit error type for Stellar transport / RPC outages. */
+export class StellarInfrastructureError extends Error {
+  /** The original error thrown by the Stellar SDK / fetch layer. */
+  readonly cause: unknown;
+
+  constructor(message: string, cause?: unknown) {
+    super(message);
+    this.name = 'StellarInfrastructureError';
+    this.cause = cause;
+    // Preserve prototype chain when compiled down to ES5.
+    Object.setPrototypeOf(this, StellarInfrastructureError.prototype);
+  }
+}
+
+export interface StellarRecipientStatus {
+  exists: boolean;
+  hasTrustline: boolean;
+  ready: boolean;
+}
+
+const NOT_FOUND_STATUS = 404;
+
+/**
+ * Returns `true` only when the error genuinely means "this account does not
+ * exist on the network". Any other error (timeout, DNS failure, 5xx, 429) is
+ * treated as an infrastructure problem.
+ */
+export function isAccountNotFoundError(err: unknown): boolean {
+  if (err == null) return false;
+
+  // Preferred: the SDK's typed error.
+  if (err instanceof NotFoundError) return true;
+
+  if (typeof err !== 'object') return false;
+
+  const anyErr = err as {
+    name?: unknown;
+    status?: unknown;
+    response?: { status?: unknown };
+    httpStatus?: unknown;
+  };
+
+  // Older/newer SDK builds expose the HTTP status in different places.
+  const status = anyErr.response?.status ?? anyErr.status ?? anyErr.httpStatus;
+  if (typeof status === 'number') {
+    return status === NOT_FOUND_STATUS;
+  }
+
+  // Last resort: SDK versions that set the name but not the status.
+  return anyErr.name === 'NotFoundError';
+}
+
+function describe
